@@ -260,41 +260,97 @@ class DIRformer(nn.Module):
 
         return out_dec_level1
 
-class CPEN(nn.Module):
-    def __init__(self,n_feats = 64, n_encoder_res = 6):
-        super(CPEN, self).__init__()
-        E1=[nn.Conv2d(48, n_feats, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1, True)]
-        E2=[
+class DefocusCPEN(nn.Module):
+    def __init__(self, n_feats=64, n_encoder_res=6):
+        super(DefocusCPEN, self).__init__()
+        
+        self.pixel_unshuffle = nn.PixelUnshuffle(4)
+        
+        self.multi_scale = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(48, n_feats//2, kernel_size=ks, padding=ks//2),
+                nn.LeakyReLU(0.1, True)
+            ) for ks in [3, 5, 7]
+        ])
+        
+        self.fusion = nn.Conv2d(n_feats//2 * 3, n_feats, kernel_size=1)
+        self.act = nn.LeakyReLU(0.1, True)
+        
+        self.depth_branch = nn.Sequential(
+            nn.Conv2d(n_feats, n_feats, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(n_feats, 1, kernel_size=3, padding=1)
+        )
+        
+        self.E2 = nn.Sequential(*[
             common.ResBlock(
                 common.default_conv, n_feats, kernel_size=3
             ) for _ in range(n_encoder_res)
-        ]
-        E3=[
-            nn.Conv2d(n_feats, n_feats * 2, kernel_size=3, padding=1),
+        ])
+        
+        self.freq_branch = FrequencyAwareModule(n_feats)
+        
+        self.E3 = nn.Sequential(
+            nn.Conv2d(n_feats*2, n_feats*2, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, True),
-            nn.Conv2d(n_feats * 2, n_feats * 2, kernel_size=3, padding=1),
+            nn.Conv2d(n_feats*2, n_feats*4, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, True),
-            nn.Conv2d(n_feats * 2, n_feats * 4, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d(1),
-        ]
-        E=E1+E2+E3
-        self.E = nn.Sequential(
-            *E
+            nn.AdaptiveAvgPool2d(1)
         )
+        
         self.mlp = nn.Sequential(
-            nn.Linear(n_feats * 4, n_feats * 4),
+            nn.Linear(n_feats*4, n_feats*4),
             nn.LeakyReLU(0.1, True),
-            nn.Linear(n_feats * 4, n_feats * 4),
+            nn.Linear(n_feats*4, n_feats*4),
             nn.LeakyReLU(0.1, True)
         )
-        self.pixel_unshuffle = nn.PixelUnshuffle(4)
+        
+        self.kernel_branch = nn.Sequential(
+            nn.Linear(n_feats*4, 64),
+            nn.LeakyReLU(0.1, True),
+            nn.Linear(64, 3)
+        )
+    
     def forward(self, x):
         x = self.pixel_unshuffle(x)
-        fea = self.E(x).squeeze(-1).squeeze(-1)
-        fea1 = self.mlp(fea)
-        return fea1
+        multi_feats = [branch(x) for branch in self.multi_scale]
+        fused_feat = self.fusion(torch.cat(multi_feats, dim=1))
+        fused_feat = self.act(fused_feat)
+        depth_map = self.depth_branch(fused_feat)
+        main_feat = self.E2(fused_feat)
+        freq_feat = self.freq_branch(main_feat)
+        combined_feat = torch.cat([main_feat, freq_feat], dim=1)
+        global_feat = self.E3(combined_feat).squeeze(-1).squeeze(-1)
+        ipr_feat = self.mlp(global_feat)
+        kernel_params = self.kernel_branch(global_feat)
+        return ipr_feat, kernel_params
+
+class FrequencyAwareModule(nn.Module):
+    def __init__(self, channels):
+        super(FrequencyAwareModule, self).__init__()
+        
+        self.attention = nn.Sequential(
+            nn.Conv2d(channels*2, channels, kernel_size=1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+        
+        self.process = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, True)
+        )
+    
+    def forward(self, x):
+        batch_size, c, h, w = x.size()
+        x_freq = torch.fft.rfft2(x)
+        x_freq_abs = torch.abs(x_freq)
+        x_freq_angle = torch.angle(x_freq)
+        x_freq_abs = torch.fft.irfft2(x_freq_abs, s=(h, w))
+        x_combined = torch.cat([x, x_freq_abs], dim=1)
+        attention_map = self.attention(x_combined)
+        enhanced_feat = x * attention_map
+        return self.process(enhanced_feat)
 
 class ResMLP(nn.Module):
     def __init__(self,n_feats = 512):
@@ -331,7 +387,7 @@ class denoise(nn.Module):
         return fea 
 
 @ARCH_REGISTRY.register()
-class DiffIRS2(nn.Module):
+class DefocusDiffIRS2(nn.Module):
     def __init__(self,         
         n_encoder_res=6,         
         inp_channels=3, 
@@ -347,7 +403,7 @@ class DiffIRS2(nn.Module):
         linear_start= 0.1,
         linear_end= 0.99, 
         timesteps = 4 ):
-        super(DiffIRS2, self).__init__()
+        super(DefocusDiffIRS2, self).__init__()
 
         # Generator
         self.G = DIRformer(        
@@ -361,7 +417,7 @@ class DiffIRS2(nn.Module):
         bias = bias,
         LayerNorm_type = LayerNorm_type   ## Other option 'BiasFree'
         )
-        self.condition = CPEN(n_feats=64, n_encoder_res=n_encoder_res)
+        self.condition = DefocusCPEN(n_feats=64, n_encoder_res=n_encoder_res)
 
         self.denoise= denoise(n_feats=64, n_denoise_res=n_denoise_res,timesteps=timesteps)
 
@@ -371,9 +427,13 @@ class DiffIRS2(nn.Module):
     def forward(self, img, IPRS1=None):
         if self.training:
             IPRS2, pred_IPR_list=self.diffusion(img,IPRS1)
+            if isinstance(IPRS2, tuple):
+                IPRS2 = IPRS2[0]
             sr = self.G(img, IPRS2)
             return sr, pred_IPR_list
         else:
             IPRS2=self.diffusion(img)
+            if isinstance(IPRS2, tuple):
+                IPRS2 = IPRS2[0]
             sr = self.G(img, IPRS2)
             return sr

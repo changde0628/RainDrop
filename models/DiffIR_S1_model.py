@@ -41,7 +41,7 @@ class Mixing_Augment:
         return target, input_
 
 @MODEL_REGISTRY.register()
-class DiffIRS1Model(SRModel):
+class DefocusDiffIRS1(SRModel):
     """
     It is trained without GAN losses.
     It mainly performs:
@@ -50,7 +50,7 @@ class DiffIRS1Model(SRModel):
     """
 
     def __init__(self, opt):
-        super(DiffIRS1Model, self).__init__(opt)
+        super(DefocusDiffIRS1, self).__init__(opt)
         if self.is_train:
             self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
             if self.mixing_flag:
@@ -118,7 +118,7 @@ class DiffIRS1Model(SRModel):
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         # do not use the synthetic process during validation
         self.is_train = False
-        super(DiffIRS1Model, self).nondist_validation(dataloader, current_iter, tb_logger, save_img)
+        super(DefocusDiffIRS1, self).nondist_validation(dataloader, current_iter, tb_logger, save_img)
         self.is_train = True
 
     def test(self):

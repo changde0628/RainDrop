@@ -45,7 +45,7 @@ class Mixing_Augment:
         return target, input_
 
 @MODEL_REGISTRY.register()
-class DiffIRS2Model(SRModel):
+class DefocusDiffIRS2(SRModel):
     """
     It is trained without GAN losses.
     It mainly performs:
@@ -54,7 +54,7 @@ class DiffIRS2Model(SRModel):
     """
 
     def __init__(self, opt):
-        super(DiffIRS2Model, self).__init__(opt)
+        super(DefocusDiffIRS2, self).__init__(opt)
         if self.is_train:
             self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
             if self.mixing_flag:
@@ -208,7 +208,7 @@ class DiffIRS2Model(SRModel):
     def nondist_validation(self, dataloader, current_iter, tb_logger, save_img):
         # do not use the synthetic process during validation
         self.is_train = False
-        super(DiffIRS2Model, self).nondist_validation(dataloader, current_iter, tb_logger, save_img)
+        super(DefocusDiffIRS2, self).nondist_validation(dataloader, current_iter, tb_logger, save_img)
         self.is_train = True
 
     def pad_test(self, window_size):        
@@ -246,56 +246,112 @@ class DiffIRS2Model(SRModel):
             self.output = self.output[:, :, 0:h - mod_pad_h * scale, 0:w - mod_pad_w * scale]
 
 
-    def optimize_parameters(self, current_iter):
-        if current_iter < self.encoder_iter:
-            lr_encoder = self.lr_encoder * (self.gamma_encoder ** ((current_iter ) // self.lr_decay_encoder))
-            for param_group in self.optimizer_e.param_groups:
-                param_group['lr'] = lr_encoder 
-        else:
-            lr = self.lr_sr * (self.gamma_sr ** ((current_iter - self.encoder_iter ) // self.lr_decay_sr))
-            for param_group in self.optimizer_g.param_groups:
-                param_group['lr'] = lr 
+def optimize_parameters(self, current_iter):
+    # 學習率調度保持不變
+    if current_iter < self.encoder_iter:
+        lr_encoder = self.lr_encoder * (self.gamma_encoder ** ((current_iter) // self.lr_decay_encoder))
+        for param_group in self.optimizer_e.param_groups:
+            param_group['lr'] = lr_encoder 
+    else:
+        lr = self.lr_sr * (self.gamma_sr ** ((current_iter - self.encoder_iter) // self.lr_decay_sr))
+        for param_group in self.optimizer_g.param_groups:
+            param_group['lr'] = lr 
+    
+    l_total = 0
+    loss_dict = OrderedDict()
+    _, S1_IPR = self.model_Es1(self.lq, self.gt)
+
+    # 根據分散式訓練狀態獲取正確的 diffusion 物件
+    if self.opt['dist']:
+        diffusion = self.net_g.module.diffusion
+    else:
+        diffusion = self.net_g.diffusion
+    
+    # 第一階段訓練 - 主要針對CPEN_S2和去噪網絡
+    if current_iter < self.encoder_iter:
+        self.optimizer_e.zero_grad()
         
-        l_total = 0
-        loss_dict = OrderedDict()
-        _, S1_IPR = self.model_Es1(self.lq,self.gt)
-
-        # 根據分散式訓練狀態獲取正確的 diffusion 物件
-        if self.opt['dist']:
-            diffusion = self.net_g.module.diffusion
+        # 如果是新的DefocusCPEN並且有kernel_branch
+        if (self.opt['dist'] and hasattr(self.net_g.module.condition, 'kernel_branch')) or \
+           (not self.opt['dist'] and hasattr(self.net_g.condition, 'kernel_branch')):
+            
+            # 使用DefocusCPEN時需要處理可能的額外輸出
+            outputs = diffusion(self.lq, S1_IPR[0])
+            
+            # 檢查返回值是否包含模糊核參數
+            if isinstance(outputs, tuple) and len(outputs) == 2:
+                pred_IPR_list, kernel_params = outputs
+                
+                # 如果配置了模糊核損失並有Ground Truth核
+                if hasattr(self, 'cri_kernel') and hasattr(self, 'kernel_gt'):
+                    l_kernel = self.cri_kernel(kernel_params, self.kernel_gt)
+                    l_total += self.opt['train']['kernel_weight'] * l_kernel
+                    loss_dict['l_kernel'] = l_kernel
+            else:
+                _, pred_IPR_list = outputs
         else:
-            diffusion = self.net_g.diffusion
+            # 原始行為
+            _, pred_IPR_list = diffusion(self.lq, S1_IPR[0])
+        
+        # 原有的KD損失計算
+        i = len(pred_IPR_list) - 1
+        S2_IPR = [pred_IPR_list[i]]
+        l_kd, l_abs = self.cri_kd(S1_IPR, S2_IPR)
+        l_total += l_abs
+        loss_dict['l_kd_%d' % (i)] = l_kd
+        loss_dict['l_abs_%d' % (i)] = l_abs
 
-        if current_iter < self.encoder_iter:
-            self.optimizer_e.zero_grad()
-            _, pred_IPR_list = diffusion(self.lq,S1_IPR[0])
-            i=len(pred_IPR_list)-1
-            S2_IPR=[pred_IPR_list[i]]
-            l_kd, l_abs = self.cri_kd(S1_IPR, S2_IPR)
-            l_total += l_abs
-            loss_dict['l_kd_%d'%(i)] = l_kd
-            loss_dict['l_abs_%d'%(i)] = l_abs
-
-            l_total.backward()
-            self.optimizer_e.step()
+        l_total.backward()
+        self.optimizer_e.step()
+    
+    # 第二階段訓練 - 整個網絡聯合訓練
+    else:
+        self.optimizer_g.zero_grad()
+        
+        # 檢查是否使用DefocusCPEN
+        if (self.opt['dist'] and hasattr(self.net_g.module.condition, 'kernel_branch')) or \
+           (not self.opt['dist'] and hasattr(self.net_g.condition, 'kernel_branch')):
+            
+            # 使用更新的forward方法處理可能的額外輸出
+            outputs = self.net_g(self.lq, S1_IPR[0])
+            
+            if isinstance(outputs, tuple) and len(outputs) == 3:
+                self.output, pred_IPR_list, kernel_params = outputs
+                
+                # 如果配置了模糊核損失並有Ground Truth核
+                if hasattr(self, 'cri_kernel') and hasattr(self, 'kernel_gt'):
+                    l_kernel = self.cri_kernel(kernel_params, self.kernel_gt)
+                    l_total += self.opt['train']['kernel_weight'] * l_kernel
+                    loss_dict['l_kernel'] = l_kernel
+            else:
+                self.output, pred_IPR_list = outputs
         else:
-            self.optimizer_g.zero_grad()
-            self.output, pred_IPR_list = self.net_g(self.lq,S1_IPR[0])
-            l_pix = self.cri_pix(self.output, self.gt)
-            l_total += l_pix
-            loss_dict['l_pix'] = l_pix
+            # 原始行為
+            self.output, pred_IPR_list = self.net_g(self.lq, S1_IPR[0])
+        
+        # 原有的像素損失
+        l_pix = self.cri_pix(self.output, self.gt)
+        l_total += l_pix
+        loss_dict['l_pix'] = l_pix
 
-            i=len(pred_IPR_list)-1
-            S2_IPR=[pred_IPR_list[i]]
-            l_kd, l_abs = self.cri_kd(S1_IPR, S2_IPR)
-            l_total += l_abs
-            loss_dict['l_kd_%d'%(i)] = l_kd
-            loss_dict['l_abs_%d'%(i)] = l_abs
+        # 原有的KD損失
+        i = len(pred_IPR_list) - 1
+        S2_IPR = [pred_IPR_list[i]]
+        l_kd, l_abs = self.cri_kd(S1_IPR, S2_IPR)
+        l_total += l_abs
+        loss_dict['l_kd_%d' % (i)] = l_kd
+        loss_dict['l_abs_%d' % (i)] = l_abs
+        
+        # 如果配置了頻域損失
+        if hasattr(self, 'cri_freq'):
+            l_freq = self.cri_freq(self.output, self.gt)
+            l_total += l_freq
+            loss_dict['l_freq'] = l_freq
 
-            l_total.backward()
-            self.optimizer_g.step()
+        l_total.backward()
+        self.optimizer_g.step()
 
-        self.log_dict = self.reduce_loss_dict(loss_dict)
+    self.log_dict = self.reduce_loss_dict(loss_dict)
 
-        if self.ema_decay > 0:
-            self.model_ema(decay=self.ema_decay)
+    if self.ema_decay > 0:
+        self.model_ema(decay=self.ema_decay)

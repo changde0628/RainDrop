@@ -256,48 +256,112 @@ class DIRformer(nn.Module):
 
         return out_dec_level1
 
-class CPEN(nn.Module):
-    def __init__(self,n_feats = 64, n_encoder_res = 6):
-        super(CPEN, self).__init__()
-        E1=[nn.Conv2d(96, n_feats, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1, True)]
-        E2=[
+# 在S1_arch.py中添加DefocusCPEN類
+class DefocusCPEN(nn.Module):
+    def __init__(self, n_feats=64, n_encoder_res=6):
+        super(DefocusCPEN, self).__init__()
+        # 多尺度特徵提取
+        self.pixel_unshuffle = nn.PixelUnshuffle(4)
+        
+        # 輸入層 - 注意這裡處理的是LQ+GT拼接
+        self.multi_scale = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(96, n_feats//2, kernel_size=ks, padding=ks//2),
+                nn.LeakyReLU(0.1, True)
+            ) for ks in [3, 5, 7]
+        ])
+        
+        # 其餘與S2中的DefocusCPEN相同
+        self.fusion = nn.Conv2d(n_feats//2 * 3, n_feats, kernel_size=1)
+        self.act = nn.LeakyReLU(0.1, True)
+        
+        # 中間特徵提取
+        self.E2 = nn.Sequential(*[
             common.ResBlock(
                 common.default_conv, n_feats, kernel_size=3
             ) for _ in range(n_encoder_res)
-        ]
-        E3=[
-            nn.Conv2d(n_feats, n_feats * 2, kernel_size=3, padding=1),
+        ])
+        
+        # 頻域感知（與S2相同）
+        self.freq_branch = FrequencyAwareModule(n_feats)
+        
+        # 特徵整合與全局池化
+        self.E3 = nn.Sequential(
+            nn.Conv2d(n_feats*2, n_feats*2, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, True),
-            nn.Conv2d(n_feats * 2, n_feats * 2, kernel_size=3, padding=1),
+            nn.Conv2d(n_feats*2, n_feats*4, kernel_size=3, padding=1),
             nn.LeakyReLU(0.1, True),
-            nn.Conv2d(n_feats * 2, n_feats * 4, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d(1),
-        ]
-        E=E1+E2+E3
-        self.E = nn.Sequential(
-            *E
+            nn.AdaptiveAvgPool2d(1)
         )
+        
+        # MLP處理全局特徵
         self.mlp = nn.Sequential(
-            nn.Linear(n_feats * 4, n_feats * 4),
+            nn.Linear(n_feats*4, n_feats*4),
             nn.LeakyReLU(0.1, True),
-            nn.Linear(n_feats * 4, n_feats * 4),
+            nn.Linear(n_feats*4, n_feats*4),
             nn.LeakyReLU(0.1, True)
         )
-        self.pixel_unshuffle = nn.PixelUnshuffle(4)
-    def forward(self, x,gt):
+    
+    def forward(self, x, gt):
+        # 處理輸入
         gt0 = self.pixel_unshuffle(gt)
         x0 = self.pixel_unshuffle(x)
         x = torch.cat([x0, gt0], dim=1)
-        fea = self.E(x).squeeze(-1).squeeze(-1)
-        S1_IPR = []
+        
+        # 多尺度特徵提取
+        multi_feats = [branch(x) for branch in self.multi_scale]
+        fused_feat = self.fusion(torch.cat(multi_feats, dim=1))
+        fused_feat = self.act(fused_feat)
+        
+        # 主干特徵提取
+        main_feat = self.E2(fused_feat)
+        
+        # 頻域處理
+        freq_feat = self.freq_branch(main_feat)
+        
+        # 特徵融合
+        combined_feat = torch.cat([main_feat, freq_feat], dim=1)
+        
+        # 全局特徵
+        fea = self.E3(combined_feat).squeeze(-1).squeeze(-1)
+        
+        # 生成IPR
         fea1 = self.mlp(fea)
+        
+        # 與原始DiffIRS1保持一致的返回格式
+        S1_IPR = []
         S1_IPR.append(fea1)
-        return fea1,S1_IPR
+        return fea1, S1_IPR
+
+class FrequencyAwareModule(nn.Module):
+    def __init__(self, channels):
+        super(FrequencyAwareModule, self).__init__()
+        
+        self.attention = nn.Sequential(
+            nn.Conv2d(channels*2, channels, kernel_size=1),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+        
+        self.process = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, True)
+        )
+    
+    def forward(self, x):
+        batch_size, c, h, w = x.size()
+        x_freq = torch.fft.rfft2(x)
+        x_freq_abs = torch.abs(x_freq)
+        x_freq_angle = torch.angle(x_freq)
+        x_freq_abs = torch.fft.irfft2(x_freq_abs, s=(h, w))
+        x_combined = torch.cat([x, x_freq_abs], dim=1)
+        attention_map = self.attention(x_combined)
+        enhanced_feat = x * attention_map
+        return self.process(enhanced_feat)
 
 @ARCH_REGISTRY.register()
-class DiffIRS1(nn.Module):
+class DefocusDiffIRS1(nn.Module):
     def __init__(self, 
         n_encoder_res=6,         
         inp_channels=3, 
@@ -310,7 +374,7 @@ class DiffIRS1(nn.Module):
         bias = False,
         LayerNorm_type = 'WithBias',   ## Other option 'BiasFree'
         ):
-        super(DiffIRS1, self).__init__()
+        super(DefocusDiffIRS1, self).__init__()
 
         # Generator
         self.G = DIRformer(        
@@ -325,7 +389,7 @@ class DiffIRS1(nn.Module):
         LayerNorm_type = LayerNorm_type,   ## Other option 'BiasFree'
         )
 
-        self.E = CPEN(n_feats=64, n_encoder_res=n_encoder_res)
+        self.E = DefocusCPEN(n_feats=64, n_encoder_res=n_encoder_res)
 
         self.pixel_unshuffle = nn.PixelUnshuffle(4)
 
