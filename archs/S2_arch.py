@@ -380,6 +380,8 @@ class denoise(nn.Module):
         t=t.float()
         t =t/self.max_period
         t=t.view(-1,1)
+        if isinstance(c, tuple):
+            c = c[0]  # Use only the ipr_feat
         c = torch.cat([c,t,x],dim=1)
         
         fea = self.resmlp(c)
